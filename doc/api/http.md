@@ -2426,7 +2426,7 @@ as an argument to any listeners on the event.
 <!-- YAML
 added: v0.1.5
 changes:
-  - version: REPLACEME
+  - version: v19.5.0
     pr-url: https://github.com/nodejs/node/pull/45982
     description: >-
      The `joinDuplicateHeaders` option in the `http.request()`
@@ -3703,13 +3703,18 @@ Passing an `AbortSignal` and then calling `abort` on the corresponding
 `AbortController` will behave the same way as calling `.destroy()` on the
 request itself.
 
-## `http.validateHeaderName(name)`
+## `http.validateHeaderName(name[, label])`
 
 <!-- YAML
 added: v14.3.0
+changes:
+  - version: v19.5.0
+    pr-url: https://github.com/nodejs/node/pull/46143
+    description: The `label` parameter is added.
 -->
 
 * `name` {string}
+* `label` {string} Label for error message. **Default:** `'Header name'`.
 
 Performs the low-level validations on the provided `name` that are done when
 `res.setHeader(name, value)` is called.
