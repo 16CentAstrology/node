@@ -20,7 +20,7 @@ namespace gdb_server {
 
 WasmModuleDebug::WasmModuleDebug(v8::Isolate* isolate,
                                  Local<debug::WasmScript> wasm_script) {
-  DCHECK_EQ(Script::TYPE_WASM, Utils::OpenHandle(*wasm_script)->type());
+  DCHECK_EQ(Script::Type::kWasm, Utils::OpenHandle(*wasm_script)->type());
 
   isolate_ = isolate;
   wasm_script_ = Global<debug::WasmScript>(isolate, wasm_script);
@@ -43,10 +43,10 @@ Handle<WasmInstanceObject> WasmModuleDebug::GetFirstWasmInstance() {
   Handle<WeakArrayList> weak_instance_list(script->wasm_weak_instance_list(),
                                            GetIsolate());
   if (weak_instance_list->length() > 0) {
-    MaybeObject maybe_instance = weak_instance_list->Get(0);
-    if (maybe_instance->IsWeak()) {
+    Tagged<MaybeObject> maybe_instance = weak_instance_list->Get(0);
+    if (maybe_instance.IsWeak()) {
       Handle<WasmInstanceObject> instance(
-          WasmInstanceObject::cast(maybe_instance->GetHeapObjectAssumeWeak()),
+          Cast<WasmInstanceObject>(maybe_instance.GetHeapObjectAssumeWeak()),
           GetIsolate());
       return instance;
     }
@@ -111,12 +111,12 @@ std::vector<wasm_addr_t> WasmModuleDebug::GetCallStack(
             FrameSummary::JavaScriptFrameSummary const& java_script =
                 summary.AsJavaScript();
             offset = java_script.code_offset();
-            script = Handle<Script>::cast(java_script.script());
+            script = Cast<Script>(java_script.script());
           } else if (summary.IsWasm()) {
             FrameSummary::WasmFrameSummary const& wasm = summary.AsWasm();
             offset = GetWasmFunctionOffset(wasm.wasm_instance()->module(),
                                            wasm.function_index()) +
-                     wasm.byte_offset();
+                     wasm.code_offset();
             script = wasm.script();
 
             bool zeroth_frame = call_stack.empty();
@@ -147,7 +147,7 @@ std::vector<wasm_addr_t> WasmModuleDebug::GetCallStack(
 
 // static
 std::vector<FrameSummary> WasmModuleDebug::FindWasmFrame(
-    StackTraceFrameIterator* frame_it, uint32_t* frame_index) {
+    DebuggableStackFrameIterator* frame_it, uint32_t* frame_index) {
   while (!frame_it->done()) {
     StackFrame* const frame = frame_it->frame();
     switch (frame->type()) {
@@ -166,7 +166,11 @@ std::vector<FrameSummary> WasmModuleDebug::FindWasmFrame(
         DCHECK_GT(frame_count, 0);
 
         if (frame_count > *frame_index) {
+#if V8_ENABLE_DRUMBRAKE
+          if (frame_it->is_wasm() && !frame_it->is_wasm_interpreter_entry())
+#else   // V8_ENABLE_DRUMBRAKE
           if (frame_it->is_wasm())
+#endif  // V8_ENABLE_DRUMBRAKE
             return frames;
           else
             return {};
@@ -189,7 +193,7 @@ std::vector<FrameSummary> WasmModuleDebug::FindWasmFrame(
 // static
 Handle<WasmInstanceObject> WasmModuleDebug::GetWasmInstance(
     Isolate* isolate, uint32_t frame_index) {
-  StackTraceFrameIterator frame_it(isolate);
+  DebuggableStackFrameIterator frame_it(isolate);
   std::vector<FrameSummary> frames = FindWasmFrame(&frame_it, &frame_index);
   if (frames.empty()) {
     return Handle<WasmInstanceObject>::null();
@@ -226,7 +230,7 @@ bool WasmModuleDebug::GetWasmLocal(Isolate* isolate, uint32_t frame_index,
                                    uint32_t buffer_size, uint32_t* size) {
   HandleScope handles(isolate);
 
-  StackTraceFrameIterator frame_it(isolate);
+  DebuggableStackFrameIterator frame_it(isolate);
   std::vector<FrameSummary> frames = FindWasmFrame(&frame_it, &frame_index);
   if (frames.empty()) {
     return false;
@@ -259,7 +263,7 @@ bool WasmModuleDebug::GetWasmStackValue(Isolate* isolate, uint32_t frame_index,
                                         uint32_t buffer_size, uint32_t* size) {
   HandleScope handles(isolate);
 
-  StackTraceFrameIterator frame_it(isolate);
+  DebuggableStackFrameIterator frame_it(isolate);
   std::vector<FrameSummary> frames = FindWasmFrame(&frame_it, &frame_index);
   if (frames.empty()) {
     return false;

@@ -149,7 +149,6 @@ async function testSign({ name,
                           plaintext }) {
   const [
     publicKey,
-    noSignPrivateKey,
     privateKey,
     hmacKey,
     rsaKeys,
@@ -161,12 +160,6 @@ async function testSign({ name,
       { name, namedCurve },
       false,
       ['verify']),
-    subtle.importKey(
-      'pkcs8',
-      privateKeyBuffer,
-      { name, namedCurve },
-      false,
-      [ /* No usages */ ]),
     subtle.importKey(
       'pkcs8',
       privateKeyBuffer,
@@ -214,12 +207,6 @@ async function testSign({ name,
       message: /Unable to use this key to sign/
     });
 
-  // Test failure when no sign usage
-  await assert.rejects(
-    subtle.sign({ name, hash }, noSignPrivateKey, plaintext), {
-      message: /Unable to use this key to sign/
-    });
-
   // Test failure when using the wrong algorithms
   await assert.rejects(
     subtle.sign({ name, hash }, hmacKey, plaintext), {
@@ -240,10 +227,11 @@ async function testSign({ name,
 (async function() {
   const variations = [];
 
-  vectors.forEach((vector) => {
+  for (let i = 0; i < vectors.length; ++i) {
+    const vector = vectors[i];
     variations.push(testVerify(vector));
     variations.push(testSign(vector));
-  });
+  }
 
   await Promise.all(variations);
 })().then(common.mustCall());

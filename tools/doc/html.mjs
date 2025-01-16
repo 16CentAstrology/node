@@ -226,9 +226,12 @@ export function preprocessElements({ filename }) {
         const className = isJSFlavorSnippet(node) ?
           `language-js ${node.lang}` :
           `language-${node.lang}`;
+
         const highlighted =
           `<code class='${className}'>${(getLanguage(node.lang || '') ? highlight(node.value, { language: node.lang }) : node).value}</code>`;
         node.type = 'html';
+
+        const copyButton = '<button class="copy-button">copy</button>';
 
         if (isJSFlavorSnippet(node)) {
           const previousNode = parent.children[index - 1] || {};
@@ -247,22 +250,23 @@ export function preprocessElements({ filename }) {
             const actualCharCount = Math.max(charCountFirstTwoLines, previousNode.charCountFirstTwoLines);
             (dynamicSizes[filename] ??= new Set()).add(actualCharCount);
             node.value = `<pre class="with-${actualCharCount}-chars">` +
-              '<input class="js-flavor-selector" type="checkbox"' +
+              '<input class="js-flavor-toggle" type="checkbox"' +
               // If CJS comes in second, ESM should display by default.
               (node.lang === 'cjs' ? ' checked' : '') +
               ' aria-label="Show modern ES modules syntax">' +
               previousNode.value +
               highlighted +
+              copyButton +
               '</pre>';
             node.lang = null;
             previousNode.value = '';
             previousNode.lang = null;
           } else {
             // Isolated JS snippet, no need to add the checkbox.
-            node.value = `<pre>${highlighted}</pre>`;
+            node.value = `<pre>${highlighted} ${copyButton}</pre>`;
           }
         } else {
-          node.value = `<pre>${highlighted}</pre>`;
+          node.value = `<pre>${highlighted} ${copyButton}</pre>`;
         }
       } else if (node.type === 'html' && common.isYAMLBlock(node.value)) {
         node.value = parseYAML(node.value);
@@ -390,8 +394,8 @@ function versionSort(a, b) {
   b = minVersion(b).trim();
   let i = 0; // Common prefix length.
   while (i < a.length && i < b.length && a[i] === b[i]) i++;
-  a = a.substr(i);
-  b = b.substr(i);
+  a = a.substring(i);
+  b = b.substring(i);
   return +b.match(numberRe)[0] - +a.match(numberRe)[0];
 }
 
@@ -424,8 +428,8 @@ export function buildToc({ filename, apilinks }) {
       const isDeprecationHeading =
         DEPRECATION_HEADING_PATTERN.test(headingText);
       if (isDeprecationHeading) {
-        if (!node.data) node.data = {};
-        if (!node.data.hProperties) node.data.hProperties = {};
+        node.data ||= {};
+        node.data.hProperties ||= {};
         node.data.hProperties.id =
           headingText.substring(0, headingText.indexOf(':'));
       }
@@ -463,7 +467,7 @@ export function buildToc({ filename, apilinks }) {
         .use(htmlStringify)
         .processSync(toc).toString();
 
-      file.toc = `<details id="toc" open><summary>Table of contents</summary>${inner}</details>`;
+      file.toc = `<details role="navigation" id="toc" open><summary>Table of contents</summary>${inner}</details>`;
       file.tocPicker = `<div class="toc">${inner}</div>`;
     } else {
       file.toc = file.tocPicker = '<!-- TOC -->';
@@ -524,7 +528,7 @@ function altDocs(filename, docCreated, versions) {
   return list ? `
     <li class="picker-header">
       <a href="#">
-        <span class="collapsed-arrow">&#x25ba;</span><span class="expanded-arrow">&#x25bc;</span>
+        <span class="picker-arrow"></span>
         Other versions
       </a>
       <div class="picker"><ol id="alt-docs">${list}</ol></div>
@@ -554,7 +558,7 @@ function gtocPicker(id) {
   return `
     <li class="picker-header">
       <a href="#">
-        <span class="collapsed-arrow">&#x25ba;</span><span class="expanded-arrow">&#x25bc;</span>
+        <span class="picker-arrow"></span>
         Index
       </a>
 
@@ -571,7 +575,7 @@ function tocPicker(id, content) {
   return `
     <li class="picker-header">
       <a href="#">
-        <span class="collapsed-arrow">&#x25ba;</span><span class="expanded-arrow">&#x25bc;</span>
+        <span class="picker-arrow"></span>
         Table of contents
       </a>
 

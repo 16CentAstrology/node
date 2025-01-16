@@ -131,6 +131,7 @@ class WASI : public BaseObject,
   static uint32_t ProcRaise(WASI&, WasmMemory, uint32_t);
   static uint32_t RandomGet(WASI&, WasmMemory, uint32_t, uint32_t);
   static uint32_t SchedYield(WASI&, WasmMemory);
+  static uint32_t SockAccept(WASI&, WasmMemory, uint32_t, uint32_t, uint32_t);
   static uint32_t SockRecv(WASI&,
                            WasmMemory,
                            uint32_t,
@@ -159,7 +160,8 @@ class WASI : public BaseObject,
                             v8::Local<v8::FunctionTemplate>);
 
    private:
-    static R FastCallback(v8::Local<v8::Object> receiver,
+    static R FastCallback(v8::Local<v8::Object> unused,
+                          v8::Local<v8::Object> receiver,
                           Args...,
                           v8::FastApiCallbackOptions&);
 

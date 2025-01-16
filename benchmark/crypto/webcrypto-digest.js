@@ -8,14 +8,14 @@ const bench = common.createBenchmark(main, {
   sync: ['createHash', 'subtle'],
   data: [10, 20, 50, 100],
   method: ['SHA-1', 'SHA-256', 'SHA-384', 'SHA-512'],
-  n: [1e3],
+  n: [1e5],
 });
 
 const kMethods = {
   'SHA-1': 'sha1',
   'SHA-256': 'sha256',
   'SHA-384': 'sha384',
-  'SHA-512': 'sha512'
+  'SHA-512': 'sha512',
 };
 
 // This benchmark only looks at clock time and ignores factors

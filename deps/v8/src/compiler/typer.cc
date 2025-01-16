@@ -16,6 +16,7 @@
 #include "src/compiler/loop-variable-optimizer.h"
 #include "src/compiler/node-properties.h"
 #include "src/compiler/node.h"
+#include "src/compiler/opcodes.h"
 #include "src/compiler/operation-typer.h"
 #include "src/compiler/simplified-operator.h"
 #include "src/compiler/type-cache.h"
@@ -79,6 +80,7 @@ class Typer::Visitor : public Reducer {
       SIMPLIFIED_BIGINT_UNOP_LIST(DECLARE_UNARY_CASE)
       SIMPLIFIED_SPECULATIVE_NUMBER_UNOP_LIST(DECLARE_UNARY_CASE)
       SIMPLIFIED_SPECULATIVE_BIGINT_UNOP_LIST(DECLARE_UNARY_CASE)
+      DECLARE_UNARY_CASE(ChangeUint32ToUint64)
 #undef DECLARE_UNARY_CASE
 #define DECLARE_BINARY_CASE(x, ...) \
   case IrOpcode::k##x:              \
@@ -117,6 +119,7 @@ class Typer::Visitor : public Reducer {
       DECLARE_IMPOSSIBLE_CASE(DeoptimizeUnless)
       DECLARE_IMPOSSIBLE_CASE(TrapIf)
       DECLARE_IMPOSSIBLE_CASE(TrapUnless)
+      DECLARE_IMPOSSIBLE_CASE(Assert)
       DECLARE_IMPOSSIBLE_CASE(Return)
       DECLARE_IMPOSSIBLE_CASE(TailCall)
       DECLARE_IMPOSSIBLE_CASE(Terminate)
@@ -125,7 +128,8 @@ class Typer::Visitor : public Reducer {
       SIMPLIFIED_CHANGE_OP_LIST(DECLARE_IMPOSSIBLE_CASE)
       SIMPLIFIED_CHECKED_OP_LIST(DECLARE_IMPOSSIBLE_CASE)
       IF_WASM(SIMPLIFIED_WASM_OP_LIST, DECLARE_IMPOSSIBLE_CASE)
-      MACHINE_SIMD_OP_LIST(DECLARE_IMPOSSIBLE_CASE)
+      MACHINE_SIMD128_OP_LIST(DECLARE_IMPOSSIBLE_CASE)
+      IF_WASM(MACHINE_SIMD256_OP_LIST, DECLARE_IMPOSSIBLE_CASE)
       MACHINE_UNOP_32_LIST(DECLARE_IMPOSSIBLE_CASE)
       DECLARE_IMPOSSIBLE_CASE(Word32Xor)
       DECLARE_IMPOSSIBLE_CASE(Word32Sar)
@@ -158,10 +162,8 @@ class Typer::Visitor : public Reducer {
       DECLARE_IMPOSSIBLE_CASE(Uint64MulHigh)
       DECLARE_IMPOSSIBLE_CASE(Word64Equal)
       DECLARE_IMPOSSIBLE_CASE(Int32LessThan)
-      DECLARE_IMPOSSIBLE_CASE(Int32LessThanOrEqual)
       DECLARE_IMPOSSIBLE_CASE(Int64LessThan)
       DECLARE_IMPOSSIBLE_CASE(Int64LessThanOrEqual)
-      DECLARE_IMPOSSIBLE_CASE(Uint64LessThan)
       DECLARE_IMPOSSIBLE_CASE(Float32Equal)
       DECLARE_IMPOSSIBLE_CASE(Float32LessThan)
       DECLARE_IMPOSSIBLE_CASE(Float32LessThanOrEqual)
@@ -177,7 +179,9 @@ class Typer::Visitor : public Reducer {
       DECLARE_IMPOSSIBLE_CASE(DebugBreak)
       DECLARE_IMPOSSIBLE_CASE(Comment)
       DECLARE_IMPOSSIBLE_CASE(LoadImmutable)
+      DECLARE_IMPOSSIBLE_CASE(StorePair)
       DECLARE_IMPOSSIBLE_CASE(Store)
+      DECLARE_IMPOSSIBLE_CASE(StoreIndirectPointer)
       DECLARE_IMPOSSIBLE_CASE(StackSlot)
       DECLARE_IMPOSSIBLE_CASE(Word32Popcnt)
       DECLARE_IMPOSSIBLE_CASE(Word64Popcnt)
@@ -215,7 +219,6 @@ class Typer::Visitor : public Reducer {
       DECLARE_IMPOSSIBLE_CASE(ChangeInt32ToInt64)
       DECLARE_IMPOSSIBLE_CASE(ChangeInt64ToFloat64)
       DECLARE_IMPOSSIBLE_CASE(ChangeUint32ToFloat64)
-      DECLARE_IMPOSSIBLE_CASE(ChangeUint32ToUint64)
       DECLARE_IMPOSSIBLE_CASE(TruncateFloat64ToFloat32)
       DECLARE_IMPOSSIBLE_CASE(TruncateInt64ToInt32)
       DECLARE_IMPOSSIBLE_CASE(RoundFloat64ToInt32)
@@ -239,7 +242,10 @@ class Typer::Visitor : public Reducer {
       DECLARE_IMPOSSIBLE_CASE(Float64Select)
       DECLARE_IMPOSSIBLE_CASE(LoadStackCheckOffset)
       DECLARE_IMPOSSIBLE_CASE(LoadFramePointer)
+      IF_WASM(DECLARE_IMPOSSIBLE_CASE, LoadStackPointer)
+      IF_WASM(DECLARE_IMPOSSIBLE_CASE, SetStackPointer)
       DECLARE_IMPOSSIBLE_CASE(LoadParentFramePointer)
+      DECLARE_IMPOSSIBLE_CASE(LoadRootRegister)
       DECLARE_IMPOSSIBLE_CASE(UnalignedLoad)
       DECLARE_IMPOSSIBLE_CASE(UnalignedStore)
       DECLARE_IMPOSSIBLE_CASE(Int32PairAdd)
@@ -250,6 +256,8 @@ class Typer::Visitor : public Reducer {
       DECLARE_IMPOSSIBLE_CASE(Word32PairSar)
       DECLARE_IMPOSSIBLE_CASE(ProtectedLoad)
       DECLARE_IMPOSSIBLE_CASE(ProtectedStore)
+      DECLARE_IMPOSSIBLE_CASE(LoadTrapOnNull)
+      DECLARE_IMPOSSIBLE_CASE(StoreTrapOnNull)
       DECLARE_IMPOSSIBLE_CASE(MemoryBarrier)
       DECLARE_IMPOSSIBLE_CASE(SignExtendWord8ToInt32)
       DECLARE_IMPOSSIBLE_CASE(SignExtendWord16ToInt32)
@@ -302,6 +310,7 @@ class Typer::Visitor : public Reducer {
 
   Zone* zone() { return typer_->zone(); }
   Graph* graph() { return typer_->graph(); }
+  JSHeapBroker* broker() { return typer_->broker(); }
 
   void SetWeakened(NodeId node_id) { weakened_nodes_.insert(node_id); }
   bool IsWeakened(NodeId node_id) {
@@ -341,6 +350,8 @@ class Typer::Visitor : public Reducer {
   static Type ToName(Type, Typer*);
   static Type ToNumber(Type, Typer*);
   static Type ToNumberConvertBigInt(Type, Typer*);
+  static Type ToBigInt(Type, Typer*);
+  static Type ToBigIntConvertNumber(Type, Typer*);
   static Type ToNumeric(Type, Typer*);
   static Type ToObject(Type, Typer*);
   static Type ToString(Type, Typer*);
@@ -352,6 +363,7 @@ class Typer::Visitor : public Reducer {
   SIMPLIFIED_BIGINT_UNOP_LIST(DECLARE_METHOD)
   SIMPLIFIED_SPECULATIVE_NUMBER_UNOP_LIST(DECLARE_METHOD)
   SIMPLIFIED_SPECULATIVE_BIGINT_UNOP_LIST(DECLARE_METHOD)
+  DECLARE_METHOD(ChangeUint32ToUint64)
 #undef DECLARE_METHOD
 #define DECLARE_METHOD(Name)                       \
   static Type Name(Type lhs, Type rhs, Typer* t) { \
@@ -385,6 +397,7 @@ class Typer::Visitor : public Reducer {
   SIMPLIFIED_BIGINT_UNOP_LIST(DECLARE_METHOD)
   SIMPLIFIED_SPECULATIVE_NUMBER_UNOP_LIST(DECLARE_METHOD)
   SIMPLIFIED_SPECULATIVE_BIGINT_UNOP_LIST(DECLARE_METHOD)
+  DECLARE_METHOD(ChangeUint32ToUint64)
 #undef DECLARE_METHOD
   static Type ObjectIsArrayBufferView(Type, Typer*);
   static Type ObjectIsBigInt(Type, Typer*);
@@ -415,6 +428,7 @@ class Typer::Visitor : public Reducer {
   static Type NumberEqualTyper(Type, Type, Typer*);
   static Type NumberLessThanTyper(Type, Type, Typer*);
   static Type NumberLessThanOrEqualTyper(Type, Type, Typer*);
+  static Type BigIntCompareTyper(Type, Type, Typer*);
   static Type ReferenceEqualTyper(Type, Type, Typer*);
   static Type SameValueTyper(Type, Type, Typer*);
   static Type SameValueNumbersOnlyTyper(Type, Type, Typer*);
@@ -675,6 +689,16 @@ Type Typer::Visitor::ToNumberConvertBigInt(Type type, Typer* t) {
 }
 
 // static
+Type Typer::Visitor::ToBigInt(Type type, Typer* t) {
+  return t->operation_typer_.ToBigInt(type);
+}
+
+// static
+Type Typer::Visitor::ToBigIntConvertNumber(Type type, Typer* t) {
+  return t->operation_typer_.ToBigIntConvertNumber(type);
+}
+
+// static
 Type Typer::Visitor::ToNumeric(Type type, Typer* t) {
   return t->operation_typer_.ToNumeric(type);
 }
@@ -683,7 +707,7 @@ Type Typer::Visitor::ToNumeric(Type type, Typer* t) {
 Type Typer::Visitor::ToObject(Type type, Typer* t) {
   // ES6 section 7.1.13 ToObject ( argument )
   if (type.Is(Type::Receiver())) return type;
-  if (type.Is(Type::Primitive())) return Type::OtherObject();
+  if (type.Is(Type::Primitive())) return Type::StringWrapperOrOtherObject();
   if (!type.Maybe(Type::OtherUndetectable())) {
     return Type::DetectableReceiver();
   }
@@ -726,7 +750,7 @@ Type Typer::Visitor::ObjectIsConstructor(Type type, Typer* t) {
   // TODO(turbofan): Introduce a Type::Constructor?
   CHECK(!type.IsNone());
   if (type.IsHeapConstant() &&
-      type.AsHeapConstant()->Ref().map().is_constructor()) {
+      type.AsHeapConstant()->Ref().map(t->broker()).is_constructor()) {
     return t->singleton_true_;
   }
   if (!type.Maybe(Type::Callable())) return t->singleton_false_;
@@ -836,7 +860,7 @@ Type Typer::Visitor::TypeParameter(Node* node) {
     if (typer_->flags() & Typer::kThisIsReceiver) {
       return Type::Receiver();
     } else {
-      // Parameter[this] can be the_hole for derived class constructors.
+      // Parameter[this] can be a hole type for derived class constructors.
       return Type::Union(Type::Hole(), Type::NonInternal(), typer_->zone());
     }
   } else if (index == start.NewTargetParameterIndex()) {
@@ -887,6 +911,10 @@ Type Typer::Visitor::TypeHeapConstant(Node* node) {
 }
 
 Type Typer::Visitor::TypeCompressedHeapConstant(Node* node) { UNREACHABLE(); }
+
+Type Typer::Visitor::TypeTrustedHeapConstant(Node* node) {
+  return TypeConstant(HeapConstantOf(node->op()));
+}
 
 Type Typer::Visitor::TypeExternalConstant(Node* node) {
   return Type::ExternalPointer();
@@ -1068,6 +1096,24 @@ bool Typer::Visitor::InductionVariablePhiTypeIsPrefixedPoint(
   if (arith_type.IsNone()) {
     type = Type::None();
   } else {
+    // We support a few additional type conversions on the lhs of the arithmetic
+    // operation. This needs to be kept in sync with the corresponding code in
+    // {LoopVariableOptimizer::TryGetInductionVariable}.
+    Node* arith_input = arith->InputAt(0);
+    switch (arith_input->opcode()) {
+      case IrOpcode::kSpeculativeToNumber:
+        type = typer_->operation_typer_.SpeculativeToNumber(type);
+        break;
+      case IrOpcode::kJSToNumber:
+        type = typer_->operation_typer_.ToNumber(type);
+        break;
+      case IrOpcode::kJSToNumberConvertBigInt:
+        type = typer_->operation_typer_.ToNumberConvertBigInt(type);
+        break;
+      default:
+        break;
+    }
+
     // Apply ordinary typing to the "increment" operation.
     // clang-format off
     switch (arith->opcode()) {
@@ -1150,6 +1196,16 @@ Type Typer::Visitor::TypeCall(Node* node) { return Type::Any(); }
 
 Type Typer::Visitor::TypeFastApiCall(Node* node) { return Type::Any(); }
 
+#ifdef V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+Type Typer::Visitor::TypeGetContinuationPreservedEmbedderData(Node* node) {
+  return Type::Any();
+}
+
+Type Typer::Visitor::TypeSetContinuationPreservedEmbedderData(Node* node) {
+  UNREACHABLE();
+}
+#endif  // V8_ENABLE_CONTINUATION_PRESERVED_EMBEDDER_DATA
+
 #if V8_ENABLE_WEBASSEMBLY
 Type Typer::Visitor::TypeJSWasmCall(Node* node) {
   const JSWasmCallParameters& op_params = JSWasmCallParametersOf(node->op());
@@ -1177,8 +1233,6 @@ Type Typer::Visitor::TypeTypeGuard(Node* node) {
   Type const type = Operand(node, 0);
   return typer_->operation_typer()->TypeTypeGuard(node->op(), type);
 }
-
-Type Typer::Visitor::TypeFoldConstant(Node* node) { return Operand(node, 0); }
 
 Type Typer::Visitor::TypeDead(Node* node) { return Type::None(); }
 Type Typer::Visitor::TypeDeadValue(Node* node) { return Type::None(); }
@@ -1361,6 +1415,8 @@ DEFINE_METHOD(ToLength)
 DEFINE_METHOD(ToName)
 DEFINE_METHOD(ToNumber)
 DEFINE_METHOD(ToNumberConvertBigInt)
+DEFINE_METHOD(ToBigInt)
+DEFINE_METHOD(ToBigIntConvertNumber)
 DEFINE_METHOD(ToNumeric)
 DEFINE_METHOD(ToObject)
 DEFINE_METHOD(ToString)
@@ -1415,7 +1471,7 @@ Type Typer::Visitor::TypeJSCreateGeneratorObject(Node* node) {
 
 Type Typer::Visitor::TypeJSCreateClosure(Node* node) {
   SharedFunctionInfoRef shared =
-      JSCreateClosureNode{node}.Parameters().shared_info(typer_->broker());
+      JSCreateClosureNode{node}.Parameters().shared_info();
   if (IsClassConstructor(shared.kind())) {
     return Type::ClassConstructor();
   } else {
@@ -1437,6 +1493,10 @@ Type Typer::Visitor::TypeJSCreateKeyValueArray(Node* node) {
 
 Type Typer::Visitor::TypeJSCreateObject(Node* node) {
   return Type::OtherObject();
+}
+
+Type Typer::Visitor::TypeJSCreateStringWrapper(Node* node) {
+  return Type::StringWrapper();
 }
 
 Type Typer::Visitor::TypeJSCreatePromise(Node* node) {
@@ -1489,7 +1549,7 @@ Type Typer::Visitor::TypeJSLoadNamed(Node* node) {
   // is not a private brand here. Otherwise Type::NonInternal() is wrong.
   JSLoadNamedNode n(node);
   NamedAccess const& p = n.Parameters();
-  DCHECK(!p.name(typer_->broker()).object()->IsPrivateBrand());
+  DCHECK(!p.name().object()->IsPrivateBrand());
 #endif
   return Type::NonInternal();
 }
@@ -1647,6 +1707,8 @@ Type Typer::Visitor::TypeJSLoadContext(Node* node) {
 
 Type Typer::Visitor::TypeJSStoreContext(Node* node) { UNREACHABLE(); }
 
+Type Typer::Visitor::TypeJSStoreScriptContext(Node* node) { UNREACHABLE(); }
+
 Type Typer::Visitor::TypeJSCreateFunctionContext(Node* node) {
   return Type::OtherInternal();
 }
@@ -1666,6 +1728,10 @@ Type Typer::Visitor::TypeJSCreateBlockContext(Node* node) {
 // JS other operators.
 
 Type Typer::Visitor::TypeJSConstructForwardVarargs(Node* node) {
+  return Type::Receiver();
+}
+
+Type Typer::Visitor::TypeJSConstructForwardAllArgs(Node* node) {
   return Type::Receiver();
 }
 
@@ -1697,10 +1763,10 @@ Type Typer::Visitor::JSCallTyper(Type fun, Typer* t) {
     return Type::NonInternal();
   }
   JSFunctionRef function = fun.AsHeapConstant()->Ref().AsJSFunction();
-  if (!function.shared().HasBuiltinId()) {
+  if (!function.shared(t->broker()).HasBuiltinId()) {
     return Type::NonInternal();
   }
-  switch (function.shared().builtin_id()) {
+  switch (function.shared(t->broker()).builtin_id()) {
     case Builtin::kMathRandom:
       return Type::PlainNumber();
     case Builtin::kMathFloor:
@@ -2124,6 +2190,14 @@ Type Typer::Visitor::NumberLessThanOrEqualTyper(Type lhs, Type rhs, Typer* t) {
       Invert(JSCompareTyper(ToNumber(rhs, t), ToNumber(lhs, t), t), t), t);
 }
 
+// static
+Type Typer::Visitor::BigIntCompareTyper(Type lhs, Type rhs, Typer* t) {
+  if (lhs.IsNone() || rhs.IsNone()) {
+    return Type::None();
+  }
+  return Type::Boolean();
+}
+
 Type Typer::Visitor::TypeNumberEqual(Node* node) {
   return TypeBinaryOp(node, NumberEqualTyper);
 }
@@ -2147,6 +2221,18 @@ Type Typer::Visitor::TypeSpeculativeNumberLessThan(Node* node) {
 Type Typer::Visitor::TypeSpeculativeNumberLessThanOrEqual(Node* node) {
   return TypeBinaryOp(node, NumberLessThanOrEqualTyper);
 }
+
+#define BIGINT_COMPARISON_BINOP(Name)              \
+  Type Typer::Visitor::Type##Name(Node* node) {    \
+    return TypeBinaryOp(node, BigIntCompareTyper); \
+  }
+BIGINT_COMPARISON_BINOP(BigIntEqual)
+BIGINT_COMPARISON_BINOP(BigIntLessThan)
+BIGINT_COMPARISON_BINOP(BigIntLessThanOrEqual)
+BIGINT_COMPARISON_BINOP(SpeculativeBigIntEqual)
+BIGINT_COMPARISON_BINOP(SpeculativeBigIntLessThan)
+BIGINT_COMPARISON_BINOP(SpeculativeBigIntLessThanOrEqual)
+#undef BIGINT_COMPARISON_BINOP
 
 Type Typer::Visitor::TypeStringConcat(Node* node) { return Type::String(); }
 
@@ -2297,12 +2383,21 @@ Type Typer::Visitor::TypeCheckString(Node* node) {
   return Type::Intersect(arg, Type::String(), zone());
 }
 
+Type Typer::Visitor::TypeCheckStringOrStringWrapper(Node* node) {
+  Type arg = Operand(node, 0);
+  return Type::Intersect(arg, Type::StringOrStringWrapper(), zone());
+}
+
 Type Typer::Visitor::TypeCheckSymbol(Node* node) {
   Type arg = Operand(node, 0);
   return Type::Intersect(arg, Type::Symbol(), zone());
 }
 
 Type Typer::Visitor::TypeCheckFloat64Hole(Node* node) {
+  return typer_->operation_typer_.CheckFloat64Hole(Operand(node, 0));
+}
+
+Type Typer::Visitor::TypeChangeFloat64HoleToTagged(Node* node) {
   return typer_->operation_typer_.CheckFloat64Hole(Operand(node, 0));
 }
 
@@ -2314,7 +2409,7 @@ Type Typer::Visitor::TypeCheckNotTaggedHole(Node* node) {
 
 Type Typer::Visitor::TypeCheckClosure(Node* node) {
   FeedbackCellRef cell = MakeRef(typer_->broker(), FeedbackCellOf(node->op()));
-  base::Optional<SharedFunctionInfoRef> shared = cell.shared_function_info();
+  OptionalSharedFunctionInfoRef shared = cell.shared_function_info(broker());
   if (!shared.has_value()) return Type::Function();
 
   if (IsClassConstructor(shared->kind())) {
@@ -2540,7 +2635,9 @@ Type Typer::Visitor::TypeRuntimeAbort(Node* node) { UNREACHABLE(); }
 
 Type Typer::Visitor::TypeAssertType(Node* node) { UNREACHABLE(); }
 
-Type Typer::Visitor::TypeVerifyType(Node* node) {
+Type Typer::Visitor::TypeVerifyType(Node* node) { UNREACHABLE(); }
+
+Type Typer::Visitor::TypeCheckTurboshaftTypeOf(Node* node) {
   return TypeOrNone(node->InputAt(0));
 }
 

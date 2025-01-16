@@ -41,7 +41,7 @@
     'has_valgrind%': 0,
     'coverage%': 0,
     'v8_target_arch%': '<(target_arch)',
-    'v8_host_byteorder%': '<!(python -c "import sys; print(sys.byteorder)")',
+    'v8_host_byteorder%': '<!("<(python)" -c "import sys; print(sys.byteorder)")',
     'force_dynamic_crt%': 0,
 
     # Setting 'v8_can_use_vfp32dregs' to 'true' will cause V8 to use the VFP
@@ -69,9 +69,6 @@
     # Enable profiling support. Only required on Windows.
     'v8_enable_prof%': 0,
 
-    # Some versions of GCC 4.5 seem to need -fno-strict-aliasing.
-    'v8_no_strict_aliasing%': 0,
-
     # Chrome needs this definition unconditionally. For standalone V8 builds,
     # it's handled in gypfiles/standalone.gypi.
     'want_separate_host_toolset%': 1,
@@ -82,7 +79,6 @@
     'v8_toolset_for_shell%': 'target',
 
     'host_os%': '<(OS)',
-    'werror%': '-Werror',
     # For a shared library build, results in "libv8-<(soname_version).so".
     'soname_version%': '',
 
@@ -133,12 +129,39 @@
       '<(V8_ROOT)',
       '<(V8_ROOT)/include',
     ],
+    'cflags!': ['-Wall', '-Wextra'],
     'conditions': [
-      ['clang', {
-        'cflags': [ '-Werror', '-Wno-unknown-pragmas' ],
-      },{
-        'cflags!': [ '-Wall', '-Wextra' ],
-        'cflags': [ '-Wno-return-type' ],
+      ['clang==0 and OS!="win"', {
+        'cflags': [
+          # In deps/v8/BUILD.gn: if (!is_clang && !is_win) { cflags += [...] }
+          '-Wno-strict-overflow',
+          '-Wno-return-type',
+          '-Wno-int-in-bool-context',
+          '-Wno-deprecated',
+          '-Wno-stringop-overflow',
+          '-Wno-stringop-overread',
+          '-Wno-restrict',
+          '-Wno-array-bounds',
+          '-Wno-nonnull',
+          '-Wno-dangling-pointer',
+          # On by default in Clang and V8 requires it at least for arm64.
+          '-flax-vector-conversions',
+        ],
+      }],
+      ['clang==1 or OS!="win"', {
+        'cflags_cc': [
+          # In deps/v8/BUILD.gn: if (is_clang || !is_win) { cflags += [...] }
+          '-Wno-invalid-offsetof',
+        ],
+        'xcode_settings': {
+          # -Wno-invalid-offsetof
+          'GCC_WARN_ABOUT_INVALID_OFFSETOF_MACRO': 'NO',
+        },
+        'msvs_settings': {
+          'VCCLCompilerTool': {
+            'AdditionalOptions': ['-Wno-invalid-offsetof'],
+          },
+        },
       }],
       ['v8_target_arch=="arm"', {
         'defines': [
@@ -330,11 +353,11 @@
               'V8_TARGET_ARCH_PPC_BE',
             ],
             'conditions': [
-              ['OS=="aix"', {
+              ['OS=="aix" or OS=="os400"', {
                 # Work around AIX ceil, trunc and round oddities.
                 'cflags': [ '-mcpu=power5+ -mfprnd' ],
               }],
-              ['OS=="aix"', {
+              ['OS=="aix" or OS=="os400"', {
                 # Work around AIX assembler popcntb bug.
                 'cflags': [ '-mno-popcntb' ],
               }],
@@ -424,9 +447,6 @@
           ['_toolset=="target"', {
             'conditions': [
               ['v8_target_arch==target_arch', {
-                'cflags': [
-                  '-Wno-error=array-bounds',  # Workaround https://gcc.gnu.org/bugzilla/show_bug.cgi?id=56273
-                ],
                 'conditions': [
                   ['v8_target_arch=="mips64el"', {
                     'cflags': ['-EL'],
@@ -517,21 +537,14 @@
         'defines': [
           'WIN32',
           'NOMINMAX',  # Refs: https://chromium-review.googlesource.com/c/v8/v8/+/1456620
-          '_WIN32_WINNT=0x0602',  # Windows 8
+          '_WIN32_WINNT=0x0A00',  # Windows 10
+          '_SILENCE_ALL_CXX20_DEPRECATION_WARNINGS',
         ],
         # 4351: VS 2005 and later are warning us that they've fixed a bug
         #       present in VS 2003 and earlier.
         'msvs_disabled_warnings': [4351],
         'msvs_configuration_attributes': {
           'CharacterSet': '1',
-        },
-      }],
-      ['OS=="win" and v8_target_arch=="ia32"', {
-        'msvs_settings': {
-          'VCCLCompilerTool': {
-            # Ensure no surprising artifacts from 80bit double math with x86.
-            'AdditionalOptions': ['/arch:SSE2'],
-          },
         },
       }],
       ['OS=="win" and v8_enable_prof==1', {
@@ -650,14 +663,6 @@
           'V8_ANDROID_LOG_STDOUT',
         ],
       }],
-      ['OS=="linux" or OS=="freebsd" or OS=="openbsd" or OS=="solaris" \
-         or OS=="netbsd" or OS=="qnx" or OS=="aix"', {
-        'conditions': [
-          [ 'v8_no_strict_aliasing==1', {
-            'cflags': [ '-fno-strict-aliasing' ],
-          }],
-        ],  # conditions
-      }],
       ['OS=="solaris"', {
         'defines': [ '__C99FEATURES__=1' ],  # isinf() etc.
       }],
@@ -667,7 +672,7 @@
       ['OS=="netbsd"', {
         'cflags': [ '-I/usr/pkg/include' ],
       }],
-      ['OS=="aix"', {
+      ['OS=="aix" or OS=="os400"', {
         'defines': [
           # Support for malloc(0)
           '_LINUX_SOURCE_COMPAT=1',
@@ -687,20 +692,14 @@
     'configurations': {
       'Debug': {
         'defines': [
-          'ENABLE_DISASSEMBLER',
-          'V8_ENABLE_CHECKS',
-          'OBJECT_PRINT',
           'DEBUG',
-          'V8_TRACE_MAPS',
-          'V8_ENABLE_ALLOCATION_TIMEOUT',
-          'V8_ENABLE_FORCE_SLOW_PATH',
         ],
         'conditions': [
           ['OS=="linux" and v8_enable_backtrace==1', {
             # Support for backtrace_symbols.
             'ldflags': [ '-rdynamic' ],
           }],
-          ['OS=="aix"', {
+          ['OS=="aix" or OS=="os400"', {
             'ldflags': [ '-Wl,-bbigtoc' ],
             'conditions': [
               ['v8_target_arch=="ppc64"', {
@@ -744,7 +743,7 @@
             },
             'conditions': [
               ['OS=="linux" or OS=="freebsd" or OS=="openbsd" or OS=="netbsd" or \
-            OS=="qnx" or OS=="aix"', {
+            OS=="qnx" or OS=="aix" or OS=="os400"', {
                 'cflags!': [
                   '-O3',
                   '-O2',
@@ -795,7 +794,7 @@
             },
             'conditions': [
               ['OS=="linux" or OS=="freebsd" or OS=="openbsd" or OS=="netbsd" or \
-            OS=="qnx" or OS=="aix"', {
+            OS=="qnx" or OS=="aix" or OS=="os400"', {
                 'cflags!': [
                   '-O0',
                   '-O1',
@@ -820,7 +819,6 @@
               ['OS=="mac"', {
                 'xcode_settings': {
                   'GCC_OPTIMIZATION_LEVEL': '3',  # -O3
-                  'GCC_STRICT_ALIASING': 'YES',
                 },
               }],
               ['v8_enable_slow_dchecks==1', {
@@ -845,7 +843,7 @@
         'defines!': ['ENABLE_HANDLE_ZAPPING',],
         'conditions': [
           ['OS=="linux" or OS=="freebsd" or OS=="openbsd" or OS=="netbsd" \
-            or OS=="aix"', {
+            or OS=="aix" or OS=="os400"', {
             'cflags!': [
               '-Os',
             ],
@@ -879,12 +877,6 @@
           ['OS=="mac"', {
             'xcode_settings': {
               'GCC_OPTIMIZATION_LEVEL': '3',  # -O3
-
-              # -fstrict-aliasing.  Mainline gcc
-              # enables this at -O2 and above,
-              # but Apple gcc does not unless it
-              # is specified explicitly.
-              'GCC_STRICT_ALIASING': 'YES',
             },
           }],  # OS=="mac"
           ['OS=="win"', {
@@ -938,13 +930,5 @@
       4724,  # https://crbug.com/v8/7771
       4800,  # Forcing value to bool.
     ],
-    # Relevant only for x86.
-    # Refs: https://github.com/nodejs/node/pull/25852
-    # Refs: https://docs.microsoft.com/en-us/cpp/build/reference/safeseh-image-has-safe-exception-handlers
-    'msvs_settings': {
-      'VCLinkerTool': {
-        'ImageHasSafeExceptionHandlers': 'false',
-      },
-    },
   },  # target_defaults
 }

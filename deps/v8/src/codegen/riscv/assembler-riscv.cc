@@ -34,10 +34,10 @@
 
 #include "src/codegen/riscv/assembler-riscv.h"
 
+#include "src/base/bits.h"
 #include "src/base/cpu.h"
 #include "src/codegen/assembler-inl.h"
 #include "src/codegen/safepoint-table.h"
-#include "src/codegen/string-constants.h"
 #include "src/deoptimizer/deoptimizer.h"
 #include "src/diagnostics/disasm.h"
 #include "src/diagnostics/disassembler.h"
@@ -46,18 +46,45 @@
 namespace v8 {
 namespace internal {
 // Get the CPU features enabled by the build. For cross compilation the
-// preprocessor symbols CAN_USE_FPU_INSTRUCTIONS
+// preprocessor symbols __riscv_f and __riscv_d
 // can be defined to enable FPU instructions when building the
 // snapshot.
 static unsigned CpuFeaturesImpliedByCompiler() {
   unsigned answer = 0;
-#ifdef CAN_USE_FPU_INSTRUCTIONS
+#if defined(__riscv_f) && defined(__riscv_d)
   answer |= 1u << FPU;
-#endif  // def CAN_USE_FPU_INSTRUCTIONS
+#endif  // def __riscv_f
 
-#if (defined CAN_USE_RVV_INSTRUCTIONS)
+#if (defined __riscv_vector) && (__riscv_v >= 1000000)
   answer |= 1u << RISCV_SIMD;
 #endif  // def CAN_USE_RVV_INSTRUCTIONS
+
+#if (defined __riscv_zba)
+  answer |= 1u << ZBA;
+#endif  // def __riscv_zba
+
+#if (defined __riscv_zbb)
+  answer |= 1u << ZBB;
+#endif  // def __riscv_zbb
+
+#if (defined __riscv_zbs)
+  answer |= 1u << ZBS;
+#endif  // def __riscv_zbs
+
+#if (defined _riscv_zicond)
+  answer |= 1u << ZICOND;
+#endif  // def _riscv_zicond
+  return answer;
+}
+
+static unsigned SimulatorFeatures() {
+  unsigned answer = 0;
+  answer |= 1u << RISCV_SIMD;
+  answer |= 1u << ZBA;
+  answer |= 1u << ZBB;
+  answer |= 1u << ZBS;
+  answer |= 1u << ZICOND;
+  answer |= 1u << FPU;
   return answer;
 }
 
@@ -68,9 +95,20 @@ void CpuFeatures::ProbeImpl(bool cross_compile) {
   // Only use statically determined features for cross compile (snapshot).
   if (cross_compile) return;
   // Probe for additional features at runtime.
+
+#ifdef USE_SIMULATOR
+  supported_ |= SimulatorFeatures();
+#else
   base::CPU cpu;
   if (cpu.has_fpu()) supported_ |= 1u << FPU;
   if (cpu.has_rvv()) supported_ |= 1u << RISCV_SIMD;
+#ifdef V8_COMPRESS_POINTERS
+  if (cpu.riscv_mmu() == base::CPU::RV_MMU_MODE::kRiscvSV57) {
+    FATAL("SV57 is not supported");
+    UNIMPLEMENTED();
+  }
+#endif  // V8_COMPRESS_POINTERS
+#endif  // USE_SIMULATOR
   // Set a static value on whether SIMD is supported.
   // This variable is only used for certain archs to query SupportWasmSimd128()
   // at runtime in builtins using an extern ref. Other callers should use
@@ -79,7 +117,11 @@ void CpuFeatures::ProbeImpl(bool cross_compile) {
 }
 
 void CpuFeatures::PrintTarget() {}
-void CpuFeatures::PrintFeatures() {}
+void CpuFeatures::PrintFeatures() {
+  printf("supports_wasm_simd_128=%d\n", CpuFeatures::SupportsWasmSimd128());
+  printf("zba=%d,zbb=%d,zbs=%d\n", CpuFeatures::IsSupported(ZBA),
+         CpuFeatures::IsSupported(ZBB), CpuFeatures::IsSupported(ZBS));
+}
 int ToNumber(Register reg) {
   DCHECK(reg.is_valid());
   const int kNumbers[] = {
@@ -132,10 +174,9 @@ Register ToRegister(int num) {
 
 const int RelocInfo::kApplyMask =
     RelocInfo::ModeMask(RelocInfo::INTERNAL_REFERENCE) |
-    RelocInfo::ModeMask(RelocInfo::NEAR_BUILTIN_ENTRY) |
     RelocInfo::ModeMask(RelocInfo::INTERNAL_REFERENCE_ENCODED) |
-    RelocInfo::ModeMask(RelocInfo::RELATIVE_CODE_TARGET) |
-    RelocInfo::ModeMask(RelocInfo::CODE_TARGET);
+    RelocInfo::ModeMask(RelocInfo::NEAR_BUILTIN_ENTRY) |
+    RelocInfo::ModeMask(RelocInfo::RELATIVE_CODE_TARGET);
 
 bool RelocInfo::IsCodedSpecially() {
   // The deserializer needs to know whether a pointer is specially coded.  Being
@@ -180,7 +221,7 @@ MemOperand::MemOperand(Register rm, int32_t unit, int32_t multiplier,
   offset_ = unit * multiplier + offset_addend;
 }
 
-void Assembler::AllocateAndInstallRequestedHeapNumbers(Isolate* isolate) {
+void Assembler::AllocateAndInstallRequestedHeapNumbers(LocalIsolate* isolate) {
   DCHECK_IMPLIES(isolate == nullptr, heap_number_requests_.empty());
   for (auto& request : heap_number_requests_) {
     Handle<HeapObject> object =
@@ -221,17 +262,20 @@ Assembler::Assembler(const AssemblerOptions& options,
 void Assembler::AbortedCodeGeneration() { constpool_.Clear(); }
 Assembler::~Assembler() { CHECK(constpool_.IsEmpty()); }
 
-void Assembler::GetCode(Isolate* isolate, CodeDesc* desc,
+void Assembler::GetCode(Isolate* isolate, CodeDesc* desc) {
+  GetCode(isolate->main_thread_local_isolate(), desc);
+}
+void Assembler::GetCode(LocalIsolate* isolate, CodeDesc* desc,
                         SafepointTableBuilder* safepoint_table_builder,
                         int handler_table_offset) {
   // As a crutch to avoid having to add manual Align calls wherever we use a
-  // raw workflow to create Code objects (mostly in tests), add another Align
-  // call here. It does no harm - the end of the Code object is aligned to the
-  // (larger) kCodeAlignment anyways.
+  // raw workflow to create InstructionStream objects (mostly in tests), add
+  // another Align call here. It does no harm - the end of the InstructionStream
+  // object is aligned to the (larger) kCodeAlignment anyways.
   // TODO(jgruber): Consider moving responsibility for proper alignment to
   // metadata table builders (safepoint, handler, constant pool, code
   // comments).
-  DataAlign(Code::kMetadataAlignment);
+  DataAlign(InstructionStream::kMetadataAlignment);
 
   ForceConstantPoolEmissionWithoutJump();
 
@@ -310,7 +354,7 @@ int Assembler::target_at(int pos, bool is_internal) {
   DEBUG_PRINTF("target_at: %p (%d)\n\t",
                reinterpret_cast<Instr*>(buffer_start_ + pos), pos);
   Instr instr = instruction->InstructionBits();
-  disassembleInstr(instruction->InstructionBits());
+  disassembleInstr(buffer_start_ + pos);
 
   switch (instruction->InstructionOpcodeType()) {
     case BRANCH: {
@@ -484,13 +528,13 @@ bool Assembler::MustUseReg(RelocInfo::Mode rmode) {
   return !RelocInfo::IsNoInfo(rmode);
 }
 
-void Assembler::disassembleInstr(Instr instr) {
+void Assembler::disassembleInstr(uint8_t* pc) {
   if (!v8_flags.riscv_debug) return;
   disasm::NameConverter converter;
   disasm::Disassembler disasm(converter);
   base::EmbeddedVector<char, 128> disasm_buffer;
 
-  disasm.InstructionDecode(disasm_buffer, reinterpret_cast<byte*>(&instr));
+  disasm.InstructionDecode(disasm_buffer, pc);
   DEBUG_PRINTF("%s\n", disasm_buffer.begin());
 }
 
@@ -564,11 +608,17 @@ void Assembler::target_at_put(int pos, int target_pos, bool is_internal,
     } break;
     default: {
       // Emitted label constant, not part of a branch.
-      // Make label relative to Code pointer of generated Code object.
-      instr_at_put(pos, target_pos + (Code::kHeaderSize - kHeapObjectTag));
+      // Make label relative to Code pointer of generated InstructionStream
+      // object.
+      instr_at_put(
+          pos, target_pos + (InstructionStream::kHeaderSize - kHeapObjectTag));
     } break;
   }
-  disassembleInstr(instr);
+
+  disassembleInstr(buffer_start_ + pos);
+  if (instruction->InstructionOpcodeType() == AUIPC) {
+    disassembleInstr(buffer_start_ + pos + 4);
+  }
 }
 
 void Assembler::print(const Label* L) {
@@ -839,7 +889,8 @@ void Assembler::label_at_put(Label* L, int at_offset) {
                reinterpret_cast<Instr*>(buffer_start_ + at_offset), at_offset);
   if (L->is_bound()) {
     target_pos = L->pos();
-    instr_at_put(at_offset, target_pos + (Code::kHeaderSize - kHeapObjectTag));
+    instr_at_put(at_offset, target_pos + (InstructionStream::kHeaderSize -
+                                          kHeapObjectTag));
   } else {
     if (L->is_linked()) {
       target_pos = L->pos();  // L's link.
@@ -884,8 +935,29 @@ void Assembler::EBREAK() {
 
 void Assembler::nop() { addi(ToRegister(0), ToRegister(0), 0); }
 
+inline int64_t signExtend(uint64_t V, int N) {
+  return int64_t(V << (64 - N)) >> (64 - N);
+}
+
 #if V8_TARGET_ARCH_RISCV64
 void Assembler::RV_li(Register rd, int64_t imm) {
+  UseScratchRegisterScope temps(this);
+  if (RecursiveLiCount(imm) > GeneralLiCount(imm, temps.hasAvailable())) {
+    GeneralLi(rd, imm);
+  } else {
+    RecursiveLi(rd, imm);
+  }
+}
+
+int Assembler::RV_li_count(int64_t imm, bool is_get_temp_reg) {
+  if (RecursiveLiCount(imm) > GeneralLiCount(imm, is_get_temp_reg)) {
+    return GeneralLiCount(imm, is_get_temp_reg);
+  } else {
+    return RecursiveLiCount(imm);
+  }
+}
+
+void Assembler::GeneralLi(Register rd, int64_t imm) {
   // 64-bit imm is put in the register rd.
   // In most cases the imm is 32 bit and 2 instructions are generated. If a
   // temporary register is available, in the worst case, 6 instructions are
@@ -913,6 +985,7 @@ void Assembler::RV_li(Register rd, int64_t imm) {
     }
     return;
   } else {
+    UseScratchRegisterScope temps(this);
     // 64-bit case: divide imm into two 32-bit parts, upper and lower
     int64_t up_32 = imm >> 32;
     int64_t low_32 = imm & 0xffffffffull;
@@ -921,7 +994,6 @@ void Assembler::RV_li(Register rd, int64_t imm) {
     if (up_32 == 0 || low_32 == 0) {
       // No temp register is needed
     } else {
-      UseScratchRegisterScope temps(this);
       BlockTrampolinePoolScope block_trampoline_pool(this);
       temp_reg = temps.hasAvailable() ? temps.Acquire() : no_reg;
     }
@@ -1037,130 +1109,21 @@ void Assembler::RV_li(Register rd, int64_t imm) {
   }
 }
 
-int Assembler::li_estimate(int64_t imm, bool is_get_temp_reg) {
-  int count = 0;
-  // imitate Assembler::RV_li
-  if (is_int32(imm + 0x800)) {
-    // 32-bit case. Maximum of 2 instructions generated
-    int64_t high_20 = ((imm + 0x800) >> 12);
-    int64_t low_12 = imm << 52 >> 52;
-    if (high_20) {
-      count++;
-      if (low_12) {
-        count++;
-      }
-    } else {
-      count++;
-    }
-    return count;
-  } else {
-    // 64-bit case: divide imm into two 32-bit parts, upper and lower
-    int64_t up_32 = imm >> 32;
-    int64_t low_32 = imm & 0xffffffffull;
-    // Check if a temporary register is available
-    if (is_get_temp_reg) {
-      // keep track of hardware behavior for lower part in sim_low
-      int64_t sim_low = 0;
-      // Build lower part
-      if (low_32 != 0) {
-        int64_t high_20 = ((low_32 + 0x800) >> 12);
-        int64_t low_12 = low_32 & 0xfff;
-        if (high_20) {
-          // Adjust to 20 bits for the case of overflow
-          high_20 &= 0xfffff;
-          sim_low = ((high_20 << 12) << 32) >> 32;
-          count++;
-          if (low_12) {
-            sim_low += (low_12 << 52 >> 52) | low_12;
-            count++;
-          }
-        } else {
-          sim_low = low_12;
-          count++;
-        }
-      }
-      if (sim_low & 0x100000000) {
-        // Bit 31 is 1. Either an overflow or a negative 64 bit
-        if (up_32 == 0) {
-          // Positive number, but overflow because of the add 0x800
-          count++;
-          count++;
-          return count;
-        }
-        // low_32 is a negative 64 bit after the build
-        up_32 = (up_32 - 0xffffffff) & 0xffffffff;
-      }
-      if (up_32 == 0) {
-        return count;
-      }
-      int64_t high_20 = (up_32 + 0x800) >> 12;
-      int64_t low_12 = up_32 & 0xfff;
-      if (high_20) {
-        // Adjust to 20 bits for the case of overflow
-        high_20 &= 0xfffff;
-        count++;
-        if (low_12) {
-          count++;
-        }
-      } else {
-        count++;
-      }
-      // Put it at the bgining of register
-      count++;
-      if (low_32 != 0) {
-        count++;
-      }
-      return count;
-    }
-    // No temp register. Build imm in rd.
-    // Build upper 32 bits first in rd. Divide lower 32 bits parts and add
-    // parts to the upper part by doing shift and add.
-    // First build upper part in rd.
-    int64_t high_20 = (up_32 + 0x800) >> 12;
-    int64_t low_12 = up_32 & 0xfff;
-    if (high_20) {
-      // Adjust to 20 bits for the case of overflow
-      high_20 &= 0xfffff;
-      count++;
-      if (low_12) {
-        count++;
-      }
-    } else {
-      count++;
-    }
-    // upper part already in rd. Each part to be added to rd, has maximum of 11
-    // bits, and always starts with a 1. rd is shifted by the size of the part
-    // plus the number of zeros between the parts. Each part is added after the
-    // left shift.
-    uint32_t mask = 0x80000000;
-    int32_t i;
-    for (i = 0; i < 32; i++) {
-      if ((low_32 & mask) == 0) {
-        mask >>= 1;
-        if (i == 31) {
-          // rest is zero
-          count++;
-        }
-        continue;
-      }
-      // The first 1 seen
-      if ((i + 11) < 32) {
-        // Pick 11 bits
-        count++;
-        count++;
-        i += 10;
-        mask >>= 11;
-      } else {
-        count++;
-        count++;
-        break;
-      }
-    }
-  }
-  return count;
-}
-
 void Assembler::li_ptr(Register rd, int64_t imm) {
+#ifdef RISCV_USE_SV39
+  // Initialize rd with an address
+  // Pointers are 39 bits
+  // 4 fixed instructions are generated
+  DCHECK_EQ((imm & 0xffffff8000000000ll), 0);
+  int64_t a8 = imm & 0xff;                      // bits 0:7. 8 bits
+  int64_t high_31 = (imm >> 8) & 0x7fffffff;    // 31 bits
+  int64_t high_20 = ((high_31 + 0x800) >> 12);  // 19 bits
+  int64_t low_12 = high_31 & 0xfff;             // 12 bits
+  lui(rd, (int32_t)high_20);
+  addi(rd, rd, low_12);  // 31 bits in rd.
+  slli(rd, rd, 8);       // Space for next 8 bis
+  ori(rd, rd, a8);       // 8 bits are put in.
+#else
   // Initialize rd with an address
   // Pointers are 48 bits
   // 6 fixed instructions are generated
@@ -1176,10 +1139,12 @@ void Assembler::li_ptr(Register rd, int64_t imm) {
   ori(rd, rd, b11);      // 11 bits are put in. 42 bit in rd
   slli(rd, rd, 6);       // Space for next 6 bits
   ori(rd, rd, a6);       // 6 bits are put in. 48 bis in rd
+#endif
 }
 
 void Assembler::li_constant(Register rd, int64_t imm) {
-  DEBUG_PRINTF("\tli_constant(%d, %lx <%ld>)\n", ToNumber(rd), imm, imm);
+  DEBUG_PRINTF("\tli_constant(%d, %" PRIx64 " <%" PRId64 ">)\n", ToNumber(rd),
+               imm, imm);
   lui(rd, (imm + (1LL << 47) + (1LL << 35) + (1LL << 23) + (1LL << 11)) >>
               48);  // Bits 63:48
   addiw(rd, rd,
@@ -1191,6 +1156,15 @@ void Assembler::li_constant(Register rd, int64_t imm) {
   addi(rd, rd, (imm + (1LL << 11)) << 40 >> 52);  // Bits 23:12
   slli(rd, rd, 12);
   addi(rd, rd, imm << 52 >> 52);  // Bits 11:0
+}
+
+void Assembler::li_constant32(Register rd, int32_t imm) {
+  ASM_CODE_COMMENT(this);
+  DEBUG_PRINTF("\tli_constant(%d, %x <%d>)\n", ToNumber(rd), imm, imm);
+  int32_t high_20 = ((imm + 0x800) >> 12);  // bits31:12
+  int32_t low_12 = imm & 0xfff;             // bits11:0
+  lui(rd, high_20);
+  addi(rd, rd, low_12);
 }
 
 #elif V8_TARGET_ARCH_RISCV32
@@ -1207,7 +1181,7 @@ void Assembler::RV_li(Register rd, int32_t imm) {
   }
 }
 
-int Assembler::li_estimate(int32_t imm, bool is_get_temp_reg) {
+int Assembler::RV_li_count(int32_t imm, bool is_get_temp_reg) {
   int count = 0;
   // imitate Assembler::RV_li
   int32_t high_20 = ((imm + 0x800) >> 12);
@@ -1236,6 +1210,7 @@ void Assembler::li_ptr(Register rd, int32_t imm) {
 }
 
 void Assembler::li_constant(Register rd, int32_t imm) {
+  ASM_CODE_COMMENT(this);
   DEBUG_PRINTF("\tli_constant(%d, %x <%d>)\n", ToNumber(rd), imm, imm);
   int32_t high_20 = ((imm + 0x800) >> 12);  // bits31:12
   int32_t low_12 = imm & 0xfff;             // bits11:0
@@ -1250,8 +1225,8 @@ void Assembler::break_(uint32_t code, bool break_as_stop) {
   // simulator expects a char pointer after the stop instruction.
   // See constants-mips.h for explanation.
   DCHECK(
-      (break_as_stop && code <= kMaxStopCode && code > kMaxWatchpointCode) ||
-      (!break_as_stop && (code > kMaxStopCode || code <= kMaxWatchpointCode)));
+      (break_as_stop && code <= kMaxStopCode && code > kMaxTracepointCode) ||
+      (!break_as_stop && (code > kMaxStopCode || code <= kMaxTracepointCode)));
 
   // since ebreak does not allow additional immediate field, we use the
   // immediate field of lui instruction immediately following the ebreak to
@@ -1338,7 +1313,11 @@ int Assembler::RelocateInternalReference(RelocInfo::Mode rmode, Address pc,
     DEBUG_PRINTF("\ttarget_address 0x%" PRIxPTR "\n", target_address);
     set_target_value_at(pc, target_address);
 #if V8_TARGET_ARCH_RISCV64
+#ifdef RISCV_USE_SV39
+    return 6;  // Number of instructions patched.
+#else
     return 8;  // Number of instructions patched.
+#endif
 #elif V8_TARGET_ARCH_RISCV32
     return 2;  // Number of instructions patched.
 #endif
@@ -1378,7 +1357,7 @@ void Assembler::GrowBuffer() {
   // Set up new buffer.
   std::unique_ptr<AssemblerBuffer> new_buffer = buffer_->Grow(new_size);
   DCHECK_EQ(new_size, new_buffer->size());
-  byte* new_start = new_buffer->start();
+  uint8_t* new_start = new_buffer->start();
 
   // Copy the data.
   intptr_t pc_delta = new_start - buffer_start_;
@@ -1397,9 +1376,9 @@ void Assembler::GrowBuffer() {
                                reloc_info_writer.last_pc() + pc_delta);
 
   // Relocate runtime entries.
-  base::Vector<byte> instructions{buffer_start_,
-                                  static_cast<size_t>(pc_offset())};
-  base::Vector<const byte> reloc_info{reloc_info_writer.pos(), reloc_size};
+  base::Vector<uint8_t> instructions{buffer_start_,
+                                     static_cast<size_t>(pc_offset())};
+  base::Vector<const uint8_t> reloc_info{reloc_info_writer.pos(), reloc_size};
   for (RelocIterator it(instructions, reloc_info, 0); !it.done(); it.next()) {
     RelocInfo::Mode rmode = it.rinfo()->rmode();
     if (rmode == RelocInfo::INTERNAL_REFERENCE) {
@@ -1412,26 +1391,19 @@ void Assembler::GrowBuffer() {
 
 void Assembler::db(uint8_t data) {
   if (!is_buffer_growth_blocked()) CheckBuffer();
-  DEBUG_PRINTF("%p(%x): constant 0x%x\n", pc_, pc_offset(), data);
+  DEBUG_PRINTF("%p(%d): constant 0x%x\n", pc_, pc_offset(), data);
   EmitHelper(data);
 }
 
-void Assembler::dd(uint32_t data, RelocInfo::Mode rmode) {
-  if (!RelocInfo::IsNoInfo(rmode)) {
-    DCHECK(RelocInfo::IsLiteralConstant(rmode));
-    RecordRelocInfo(rmode);
-  }
+void Assembler::dd(uint32_t data) {
   if (!is_buffer_growth_blocked()) CheckBuffer();
-  DEBUG_PRINTF("%p(%x): constant 0x%x\n", pc_, pc_offset(), data);
+  DEBUG_PRINTF("%p(%d): constant 0x%x\n", pc_, pc_offset(), data);
   EmitHelper(data);
 }
 
-void Assembler::dq(uint64_t data, RelocInfo::Mode rmode) {
-  if (!RelocInfo::IsNoInfo(rmode)) {
-    DCHECK(RelocInfo::IsLiteralConstant(rmode));
-    RecordRelocInfo(rmode);
-  }
+void Assembler::dq(uint64_t data) {
   if (!is_buffer_growth_blocked()) CheckBuffer();
+  DEBUG_PRINTF("%p(%d): constant 0x%" PRIx64 "\n", pc_, pc_offset(), data);
   EmitHelper(data);
 }
 
@@ -1451,7 +1423,7 @@ void Assembler::dd(Label* label) {
 void Assembler::RecordRelocInfo(RelocInfo::Mode rmode, intptr_t data) {
   if (!ShouldRecordRelocInfo(rmode)) return;
   // We do not try to reuse pool constants.
-  RelocInfo rinfo(reinterpret_cast<Address>(pc_), rmode, data, Code());
+  RelocInfo rinfo(reinterpret_cast<Address>(pc_), rmode, data);
   DCHECK_GE(buffer_space(), kMaxRelocSize);  // Too late to grow buffer here.
   reloc_info_writer.Write(&rinfo);
 }
@@ -1587,6 +1559,24 @@ Address Assembler::target_address_at(Address pc, Address constant_pool) {
 #if V8_TARGET_ARCH_RISCV64
 Address Assembler::target_address_at(Address pc) {
   DEBUG_PRINTF("target_address_at: pc: %lx\t", pc);
+#ifdef RISCV_USE_SV39
+  Instruction* instr0 = Instruction::At((unsigned char*)pc);
+  Instruction* instr1 = Instruction::At((unsigned char*)(pc + 1 * kInstrSize));
+  Instruction* instr2 = Instruction::At((unsigned char*)(pc + 2 * kInstrSize));
+  Instruction* instr3 = Instruction::At((unsigned char*)(pc + 3 * kInstrSize));
+
+  // Interpret instructions for address generated by li: See listing in
+  // Assembler::set_target_address_at() just below.
+  if (IsLui(*reinterpret_cast<Instr*>(instr0)) &&
+      IsAddi(*reinterpret_cast<Instr*>(instr1)) &&
+      IsSlli(*reinterpret_cast<Instr*>(instr2)) &&
+      IsOri(*reinterpret_cast<Instr*>(instr3))) {
+    // Assemble the 64 bit value.
+    int64_t addr = (int64_t)(instr0->Imm20UValue() << kImm20Shift) +
+                   (int64_t)instr1->Imm12Value();
+    addr <<= 8;
+    addr |= (int64_t)instr3->Imm12Value();
+#else
   Instruction* instr0 = Instruction::At((unsigned char*)pc);
   Instruction* instr1 = Instruction::At((unsigned char*)(pc + 1 * kInstrSize));
   Instruction* instr2 = Instruction::At((unsigned char*)(pc + 2 * kInstrSize));
@@ -1609,8 +1599,8 @@ Address Assembler::target_address_at(Address pc) {
     addr |= (int64_t)instr3->Imm12Value();
     addr <<= 6;
     addr |= (int64_t)instr5->Imm12Value();
-
-    DEBUG_PRINTF("addr: %lx\n", addr);
+#endif
+    DEBUG_PRINTF("addr: %" PRIx64 "\n", addr);
     return static_cast<Address>(addr);
   }
   // We should never get here, force a bad address if we do.
@@ -1624,12 +1614,47 @@ Address Assembler::target_address_at(Address pc) {
 //  slli(reg, reg, 6); // Space for next 6 bits
 //  ori(reg, reg, a6); // 6 bits are put in. all 48 bis in reg
 //
+// If define RISCV_USE_SV39, a 39-bit target address is stored in an
+// 4-instruction sequence:
+//  lui(reg, (int32_t)high_20); // 20 high bits
+//  addi(reg, reg, low_12); // 12 following bits. total is 32 high bits in reg.
+//  slli(reg, reg, 7); // Space for next 7 bits
+//  ori(reg, reg, a7); // 7 bits are put in.
+//
 // Patching the address must replace all instructions, and flush the i-cache.
 // Note that this assumes the use of SV48, the 48-bit virtual memory system.
 void Assembler::set_target_value_at(Address pc, uint64_t target,
                                     ICacheFlushMode icache_flush_mode) {
-  DEBUG_PRINTF("set_target_value_at: pc: %lx\ttarget: %lx\n", pc, target);
+  DEBUG_PRINTF("set_target_value_at: pc: %" PRIxPTR "\ttarget: %" PRIx64 "\n",
+               pc, target);
   uint32_t* p = reinterpret_cast<uint32_t*>(pc);
+#ifdef RISCV_USE_SV39
+  DCHECK_EQ((target & 0xffffff8000000000ll), 0);
+#ifdef DEBUG
+  // Check we have the result from a li macro-instruction.
+  Instruction* instr0 = Instruction::At((unsigned char*)pc);
+  Instruction* instr1 = Instruction::At((unsigned char*)(pc + 1 * kInstrSize));
+  Instruction* instr3 = Instruction::At((unsigned char*)(pc + 3 * kInstrSize));
+  DCHECK(IsLui(*reinterpret_cast<Instr*>(instr0)) &&
+         IsAddi(*reinterpret_cast<Instr*>(instr1)) &&
+         IsOri(*reinterpret_cast<Instr*>(instr3)));
+#endif
+  int64_t a8 = target & 0xff;                    // bits 0:7. 8 bits
+  int64_t high_31 = (target >> 8) & 0x7fffffff;  // 31 bits
+  int64_t high_20 = ((high_31 + 0x800) >> 12);   // 19 bits
+  int64_t low_12 = high_31 & 0xfff;              // 12 bits
+  *p = *p & 0xfff;
+  *p = *p | ((int32_t)high_20 << 12);
+  *(p + 1) = *(p + 1) & 0xfffff;
+  *(p + 1) = *(p + 1) | ((int32_t)low_12 << 20);
+  *(p + 2) = *(p + 2) & 0xfffff;
+  *(p + 2) = *(p + 2) | (8 << 20);
+  *(p + 3) = *(p + 3) & 0xfffff;
+  *(p + 3) = *(p + 3) | ((int32_t)a8 << 20);
+  if (icache_flush_mode != SKIP_ICACHE_FLUSH) {
+    FlushInstructionCache(pc, 6 * kInstrSize);
+  }
+#else
   DCHECK_EQ((target & 0xffff000000000000ll), 0);
 #ifdef DEBUG
   // Check we have the result from a li macro-instruction.
@@ -1662,26 +1687,16 @@ void Assembler::set_target_value_at(Address pc, uint64_t target,
   if (icache_flush_mode != SKIP_ICACHE_FLUSH) {
     FlushInstructionCache(pc, 8 * kInstrSize);
   }
+#endif
   DCHECK_EQ(target_address_at(pc), target);
 }
+
 #elif V8_TARGET_ARCH_RISCV32
 Address Assembler::target_address_at(Address pc) {
   DEBUG_PRINTF("target_address_at: pc: %x\t", pc);
-  Instruction* instr0 = Instruction::At((unsigned char*)pc);
-  Instruction* instr1 = Instruction::At((unsigned char*)(pc + 1 * kInstrSize));
-
-  // Interpret instructions for address generated by li: See listing in
-  // Assembler::set_target_address_at() just below.
-  if (IsLui(*reinterpret_cast<Instr*>(instr0)) &&
-      IsAddi(*reinterpret_cast<Instr*>(instr1))) {
-    // Assemble the 32bit value.
-    int32_t addr = (int32_t)(instr0->Imm20UValue() << kImm20Shift) +
-                   (int32_t)instr1->Imm12Value();
-    DEBUG_PRINTF("addr: %x\n", addr);
-    return static_cast<Address>(addr);
-  }
-  // We should never get here, force a bad address if we do.
-  UNREACHABLE();
+  int32_t addr = target_constant32_at(pc);
+  DEBUG_PRINTF("addr: %x\n", addr);
+  return static_cast<Address>(addr);
 }
 // On RISC-V, a 32-bit target address is stored in an 2-instruction sequence:
 //  lui(reg, high_20); // 20 high bits
@@ -1691,44 +1706,9 @@ Address Assembler::target_address_at(Address pc) {
 void Assembler::set_target_value_at(Address pc, uint32_t target,
                                     ICacheFlushMode icache_flush_mode) {
   DEBUG_PRINTF("set_target_value_at: pc: %x\ttarget: %x\n", pc, target);
-  uint32_t* p = reinterpret_cast<uint32_t*>(pc);
-#ifdef DEBUG
-  // Check we have the result from a li macro-instruction.
-  Instruction* instr0 = Instruction::At((unsigned char*)pc);
-  Instruction* instr1 = Instruction::At((unsigned char*)(pc + 1 * kInstrSize));
-  DCHECK(IsLui(*reinterpret_cast<Instr*>(instr0)) &&
-         IsAddi(*reinterpret_cast<Instr*>(instr1)));
-#endif
-  int32_t high_20 = ((target + 0x800) >> 12);  // 20 bits
-  int32_t low_12 = target & 0xfff;             // 12 bits
-  *p = *p & 0xfff;
-  *p = *p | ((int32_t)high_20 << 12);
-  *(p + 1) = *(p + 1) & 0xfffff;
-  *(p + 1) = *(p + 1) | ((int32_t)low_12 << 20);
-  if (icache_flush_mode != SKIP_ICACHE_FLUSH) {
-    FlushInstructionCache(pc, 2 * kInstrSize);
-  }
-  DCHECK_EQ(target_address_at(pc), target);
+  set_target_constant32_at(pc, target, icache_flush_mode);
 }
 #endif
-
-UseScratchRegisterScope::UseScratchRegisterScope(Assembler* assembler)
-    : available_(assembler->GetScratchRegisterList()),
-      old_available_(*available_) {}
-
-UseScratchRegisterScope::~UseScratchRegisterScope() {
-  *available_ = old_available_;
-}
-
-Register UseScratchRegisterScope::Acquire() {
-  DCHECK_NOT_NULL(available_);
-  DCHECK(!available_->is_empty());
-  int index =
-      static_cast<int>(base::bits::CountTrailingZeros32(available_->bits()));
-  *available_ &= RegList::FromBits(~(1U << index));
-
-  return Register::from_code(index);
-}
 
 bool UseScratchRegisterScope::hasAvailable() const {
   return !available_->is_empty();
@@ -1790,9 +1770,9 @@ void Assembler::emit(Instr x) {
   if (!is_buffer_growth_blocked()) {
     CheckBuffer();
   }
-  DEBUG_PRINTF("%p(%x): ", pc_, pc_offset());
-  disassembleInstr(x);
+  DEBUG_PRINTF("%p(%d): ", pc_, pc_offset());
   EmitHelper(x);
+  disassembleInstr(pc_ - sizeof(x));
   CheckTrampolinePoolQuick();
 }
 
@@ -1800,13 +1780,14 @@ void Assembler::emit(ShortInstr x) {
   if (!is_buffer_growth_blocked()) {
     CheckBuffer();
   }
-  DEBUG_PRINTF("%p(%x): ", pc_, pc_offset());
-  disassembleInstr(x);
+  DEBUG_PRINTF("%p(%d): ", pc_, pc_offset());
   EmitHelper(x);
+  disassembleInstr(pc_ - sizeof(x));
   CheckTrampolinePoolQuick();
 }
 
 void Assembler::emit(uint64_t data) {
+  DEBUG_PRINTF("%p(%d): ", pc_, pc_offset());
   if (!is_buffer_growth_blocked()) CheckBuffer();
   EmitHelper(data);
 }
@@ -1909,5 +1890,325 @@ const size_t ConstantPool::kOpportunityDistToPool32 = 64 * KB;
 const size_t ConstantPool::kOpportunityDistToPool64 = 64 * KB;
 const size_t ConstantPool::kApproxMaxEntryCount = 512;
 
+#if defined(V8_TARGET_ARCH_RISCV64)
+// LLVM Code
+//===- RISCVMatInt.cpp - Immediate materialisation -------------*- C++
+//-*--===//
+//
+//  Part of the LLVM Project, under the Apache License v2.0 with LLVM
+//  Exceptions. See https://llvm.org/LICENSE.txt for license information.
+//  SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+void Assembler::RecursiveLi(Register rd, int64_t val) {
+  if (val > 0 && RecursiveLiImplCount(val) > 2) {
+    unsigned LeadingZeros = base::bits::CountLeadingZeros((uint64_t)val);
+    uint64_t ShiftedVal = (uint64_t)val << LeadingZeros;
+    int countFillZero = RecursiveLiImplCount(ShiftedVal) + 1;
+    if (countFillZero < RecursiveLiImplCount(val)) {
+      RecursiveLiImpl(rd, ShiftedVal);
+      srli(rd, rd, LeadingZeros);
+      return;
+    }
+  }
+  RecursiveLiImpl(rd, val);
+}
+
+int Assembler::RecursiveLiCount(int64_t val) {
+  if (val > 0 && RecursiveLiImplCount(val) > 2) {
+    unsigned LeadingZeros = base::bits::CountLeadingZeros((uint64_t)val);
+    uint64_t ShiftedVal = (uint64_t)val << LeadingZeros;
+    // Fill in the bits that will be shifted out with 1s. An example where
+    // this helps is trailing one masks with 32 or more ones. This will
+    // generate ADDI -1 and an SRLI.
+    int countFillZero = RecursiveLiImplCount(ShiftedVal) + 1;
+    if (countFillZero < RecursiveLiImplCount(val)) {
+      return countFillZero;
+    }
+  }
+  return RecursiveLiImplCount(val);
+}
+
+void Assembler::RecursiveLiImpl(Register rd, int64_t Val) {
+  if (is_int32(Val)) {
+    // Depending on the active bits in the immediate Value v, the following
+    // instruction sequences are emitted:
+    //
+    // v == 0                        : ADDI
+    // v[0,12) != 0 && v[12,32) == 0 : ADDI
+    // v[0,12) == 0 && v[12,32) != 0 : LUI
+    // v[0,32) != 0                  : LUI+ADDI(W)
+    int64_t Hi20 = ((Val + 0x800) >> 12) & 0xFFFFF;
+    int64_t Lo12 = Val << 52 >> 52;
+
+    if (Hi20) {
+      lui(rd, (int32_t)Hi20);
+    }
+
+    if (Lo12 || Hi20 == 0) {
+      if (Hi20) {
+        addiw(rd, rd, Lo12);
+      } else {
+        addi(rd, zero_reg, Lo12);
+      }
+    }
+    return;
+  }
+
+  // In the worst case, for a full 64-bit constant, a sequence of 8
+  // instructions (i.e., LUI+ADDIW+SLLI+ADDI+SLLI+ADDI+SLLI+ADDI) has to be
+  // emitted. Note that the first two instructions (LUI+ADDIW) can contribute
+  // up to 32 bits while the following ADDI instructions contribute up to 12
+  // bits each.
+  //
+  // On the first glance, implementing this seems to be possible by simply
+  // emitting the most significant 32 bits (LUI+ADDIW) followed by as many
+  // left shift (SLLI) and immediate additions (ADDI) as needed. However, due
+  // to the fact that ADDI performs a sign extended addition, doing it like
+  // that would only be possible when at most 11 bits of the ADDI instructions
+  // are used. Using all 12 bits of the ADDI instructions, like done by GAS,
+  // actually requires that the constant is processed starting with the least
+  // significant bit.
+  //
+  // In the following, constants are processed from LSB to MSB but instruction
+  // emission is performed from MSB to LSB by recursively calling
+  // generateInstSeq. In each recursion, first the lowest 12 bits are removed
+  // from the constant and the optimal shift amount, which can be greater than
+  // 12 bits if the constant is sparse, is determined. Then, the shifted
+  // remaining constant is processed recursively and gets emitted as soon as
+  // it fits into 32 bits. The emission of the shifts and additions is
+  // subsequently performed when the recursion returns.
+
+  int64_t Lo12 = Val << 52 >> 52;
+  int64_t Hi52 = ((uint64_t)Val + 0x800ull) >> 12;
+  int ShiftAmount = 12 + base::bits::CountTrailingZeros((uint64_t)Hi52);
+  Hi52 = signExtend(Hi52 >> (ShiftAmount - 12), 64 - ShiftAmount);
+
+  // If the remaining bits don't fit in 12 bits, we might be able to reduce
+  // the shift amount in order to use LUI which will zero the lower 12 bits.
+  bool Unsigned = false;
+  if (ShiftAmount > 12 && !is_int12(Hi52)) {
+    if (is_int32((uint64_t)Hi52 << 12)) {
+      // Reduce the shift amount and add zeros to the LSBs so it will match
+      // LUI.
+      ShiftAmount -= 12;
+      Hi52 = (uint64_t)Hi52 << 12;
+    }
+  }
+  RecursiveLi(rd, Hi52);
+
+  if (Unsigned) {
+  } else {
+    slli(rd, rd, ShiftAmount);
+  }
+  if (Lo12) {
+    addi(rd, rd, Lo12);
+  }
+}
+
+int Assembler::RecursiveLiImplCount(int64_t Val) {
+  int count = 0;
+  if (is_int32(Val)) {
+    // Depending on the active bits in the immediate Value v, the following
+    // instruction sequences are emitted:
+    //
+    // v == 0                        : ADDI
+    // v[0,12) != 0 && v[12,32) == 0 : ADDI
+    // v[0,12) == 0 && v[12,32) != 0 : LUI
+    // v[0,32) != 0                  : LUI+ADDI(W)
+    int64_t Hi20 = ((Val + 0x800) >> 12) & 0xFFFFF;
+    int64_t Lo12 = Val << 52 >> 52;
+
+    if (Hi20) {
+      // lui(rd, (int32_t)Hi20);
+      count++;
+    }
+
+    if (Lo12 || Hi20 == 0) {
+      //   unsigned AddiOpc = (IsRV64 && Hi20) ? RISCV::ADDIW : RISCV::ADDI;
+      //   Res.push_back(RISCVMatInt::Inst(AddiOpc, Lo12));
+      count++;
+    }
+    return count;
+  }
+
+  // In the worst case, for a full 64-bit constant, a sequence of 8
+  // instructions (i.e., LUI+ADDIW+SLLI+ADDI+SLLI+ADDI+SLLI+ADDI) has to be
+  // emitted. Note that the first two instructions (LUI+ADDIW) can contribute
+  // up to 32 bits while the following ADDI instructions contribute up to 12
+  // bits each.
+  //
+  // On the first glance, implementing this seems to be possible by simply
+  // emitting the most significant 32 bits (LUI+ADDIW) followed by as many
+  // left shift (SLLI) and immediate additions (ADDI) as needed. However, due
+  // to the fact that ADDI performs a sign extended addition, doing it like
+  // that would only be possible when at most 11 bits of the ADDI instructions
+  // are used. Using all 12 bits of the ADDI instructions, like done by GAS,
+  // actually requires that the constant is processed starting with the least
+  // significant bit.
+  //
+  // In the following, constants are processed from LSB to MSB but instruction
+  // emission is performed from MSB to LSB by recursively calling
+  // generateInstSeq. In each recursion, first the lowest 12 bits are removed
+  // from the constant and the optimal shift amount, which can be greater than
+  // 12 bits if the constant is sparse, is determined. Then, the shifted
+  // remaining constant is processed recursively and gets emitted as soon as
+  // it fits into 32 bits. The emission of the shifts and additions is
+  // subsequently performed when the recursion returns.
+
+  int64_t Lo12 = Val << 52 >> 52;
+  int64_t Hi52 = ((uint64_t)Val + 0x800ull) >> 12;
+  int ShiftAmount = 12 + base::bits::CountTrailingZeros((uint64_t)Hi52);
+  Hi52 = signExtend(Hi52 >> (ShiftAmount - 12), 64 - ShiftAmount);
+
+  // If the remaining bits don't fit in 12 bits, we might be able to reduce
+  // the shift amount in order to use LUI which will zero the lower 12 bits.
+  bool Unsigned = false;
+  if (ShiftAmount > 12 && !is_int12(Hi52)) {
+    if (is_int32((uint64_t)Hi52 << 12)) {
+      // Reduce the shift amount and add zeros to the LSBs so it will match
+      // LUI.
+      ShiftAmount -= 12;
+      Hi52 = (uint64_t)Hi52 << 12;
+    }
+  }
+
+  count += RecursiveLiImplCount(Hi52);
+
+  if (Unsigned) {
+  } else {
+    // slli(rd, rd, ShiftAmount);
+    count++;
+  }
+  if (Lo12) {
+    // addi(rd, rd, Lo12);
+    count++;
+  }
+  return count;
+}
+
+int Assembler::GeneralLiCount(int64_t imm, bool is_get_temp_reg) {
+  int count = 0;
+  // imitate Assembler::RV_li
+  if (is_int32(imm + 0x800)) {
+    // 32-bit case. Maximum of 2 instructions generated
+    int64_t high_20 = ((imm + 0x800) >> 12);
+    int64_t low_12 = imm << 52 >> 52;
+    if (high_20) {
+      count++;
+      if (low_12) {
+        count++;
+      }
+    } else {
+      count++;
+    }
+    return count;
+  } else {
+    // 64-bit case: divide imm into two 32-bit parts, upper and lower
+    int64_t up_32 = imm >> 32;
+    int64_t low_32 = imm & 0xffffffffull;
+    // Check if a temporary register is available
+    if (is_get_temp_reg) {
+      // keep track of hardware behavior for lower part in sim_low
+      int64_t sim_low = 0;
+      // Build lower part
+      if (low_32 != 0) {
+        int64_t high_20 = ((low_32 + 0x800) >> 12);
+        int64_t low_12 = low_32 & 0xfff;
+        if (high_20) {
+          // Adjust to 20 bits for the case of overflow
+          high_20 &= 0xfffff;
+          sim_low = ((high_20 << 12) << 32) >> 32;
+          count++;
+          if (low_12) {
+            sim_low += (low_12 << 52 >> 52) | low_12;
+            count++;
+          }
+        } else {
+          sim_low = low_12;
+          count++;
+        }
+      }
+      if (sim_low & 0x100000000) {
+        // Bit 31 is 1. Either an overflow or a negative 64 bit
+        if (up_32 == 0) {
+          // Positive number, but overflow because of the add 0x800
+          count++;
+          count++;
+          return count;
+        }
+        // low_32 is a negative 64 bit after the build
+        up_32 = (up_32 - 0xffffffff) & 0xffffffff;
+      }
+      if (up_32 == 0) {
+        return count;
+      }
+      int64_t high_20 = (up_32 + 0x800) >> 12;
+      int64_t low_12 = up_32 & 0xfff;
+      if (high_20) {
+        // Adjust to 20 bits for the case of overflow
+        high_20 &= 0xfffff;
+        count++;
+        if (low_12) {
+          count++;
+        }
+      } else {
+        count++;
+      }
+      // Put it at the bgining of register
+      count++;
+      if (low_32 != 0) {
+        count++;
+      }
+      return count;
+    }
+    // No temp register. Build imm in rd.
+    // Build upper 32 bits first in rd. Divide lower 32 bits parts and add
+    // parts to the upper part by doing shift and add.
+    // First build upper part in rd.
+    int64_t high_20 = (up_32 + 0x800) >> 12;
+    int64_t low_12 = up_32 & 0xfff;
+    if (high_20) {
+      // Adjust to 20 bits for the case of overflow
+      high_20 &= 0xfffff;
+      count++;
+      if (low_12) {
+        count++;
+      }
+    } else {
+      count++;
+    }
+    // upper part already in rd. Each part to be added to rd, has maximum of
+    // 11 bits, and always starts with a 1. rd is shifted by the size of the
+    // part plus the number of zeros between the parts. Each part is added
+    // after the left shift.
+    uint32_t mask = 0x80000000;
+    int32_t i;
+    for (i = 0; i < 32; i++) {
+      if ((low_32 & mask) == 0) {
+        mask >>= 1;
+        if (i == 31) {
+          // rest is zero
+          count++;
+        }
+        continue;
+      }
+      // The first 1 seen
+      if ((i + 11) < 32) {
+        // Pick 11 bits
+        count++;
+        count++;
+        i += 10;
+        mask >>= 11;
+      } else {
+        count++;
+        count++;
+        break;
+      }
+    }
+  }
+  return count;
+}
+#endif
 }  // namespace internal
 }  // namespace v8
