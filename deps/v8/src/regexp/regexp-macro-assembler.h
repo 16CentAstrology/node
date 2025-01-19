@@ -6,6 +6,7 @@
 #define V8_REGEXP_REGEXP_MACRO_ASSEMBLER_H_
 
 #include "src/base/strings.h"
+#include "src/execution/frame-constants.h"
 #include "src/objects/fixed-array.h"
 #include "src/regexp/regexp-ast.h"
 #include "src/regexp/regexp.h"
@@ -215,8 +216,7 @@ class RegExpMacroAssembler {
   //
   // Called from generated code.
   static uint32_t IsCharacterInRangeArray(uint32_t current_char,
-                                          Address raw_byte_array,
-                                          Isolate* isolate);
+                                          Address raw_byte_array);
 
   // Controls the generation of large inlined constants in the code.
   void set_slow_safe(bool ssc) { slow_safe_compiler_ = ssc; }
@@ -298,16 +298,15 @@ class NativeRegExpMacroAssembler: public RegExpMacroAssembler {
   ~NativeRegExpMacroAssembler() override = default;
 
   // Returns a {Result} sentinel, or the number of successful matches.
-  static int Match(Handle<JSRegExp> regexp, Handle<String> subject,
-                   int* offsets_vector, int offsets_vector_length,
-                   int previous_index, Isolate* isolate);
+  static int Match(DirectHandle<IrRegExpData> regexp_data,
+                   DirectHandle<String> subject, int* offsets_vector,
+                   int offsets_vector_length, int previous_index,
+                   Isolate* isolate);
 
-  V8_EXPORT_PRIVATE static int ExecuteForTesting(String input, int start_offset,
-                                                 const byte* input_start,
-                                                 const byte* input_end,
-                                                 int* output, int output_size,
-                                                 Isolate* isolate,
-                                                 JSRegExp regexp);
+  V8_EXPORT_PRIVATE static int ExecuteForTesting(
+      Tagged<String> input, int start_offset, const uint8_t* input_start,
+      const uint8_t* input_end, int* output, int output_size, Isolate* isolate,
+      Tagged<JSRegExp> regexp);
 
   bool CanReadUnaligned() const override;
 
@@ -330,9 +329,10 @@ class NativeRegExpMacroAssembler: public RegExpMacroAssembler {
   // Called from generated code.
   static int CheckStackGuardState(Isolate* isolate, int start_index,
                                   RegExp::CallOrigin call_origin,
-                                  Address* return_address, Code re_code,
-                                  Address* subject, const byte** input_start,
-                                  const byte** input_end);
+                                  Address* return_address,
+                                  Tagged<InstructionStream> re_code,
+                                  Address* subject, const uint8_t** input_start,
+                                  const uint8_t** input_end, uintptr_t gap);
 
   static Address word_character_map_address() {
     return reinterpret_cast<Address>(&word_character_map[0]);
@@ -342,15 +342,16 @@ class NativeRegExpMacroAssembler: public RegExpMacroAssembler {
   // Byte map of one byte characters with a 0xff if the character is a word
   // character (digit, letter or underscore) and 0x00 otherwise.
   // Used by generated RegExp code.
-  static const byte word_character_map[256];
+  static const uint8_t word_character_map[256];
 
   Handle<ByteArray> GetOrAddRangeArray(const ZoneList<CharacterRange>* ranges);
 
  private:
   // Returns a {Result} sentinel, or the number of successful matches.
-  static int Execute(String input, int start_offset, const byte* input_start,
-                     const byte* input_end, int* output, int output_size,
-                     Isolate* isolate, JSRegExp regexp);
+  static int Execute(Tagged<String> input, int start_offset,
+                     const uint8_t* input_start, const uint8_t* input_end,
+                     int* output, int output_size, Isolate* isolate,
+                     Tagged<IrRegExpData> regexp_data);
 
   ZoneUnorderedMap<uint32_t, Handle<FixedUInt16Array>> range_array_cache_;
 };

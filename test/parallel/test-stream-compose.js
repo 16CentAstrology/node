@@ -1,16 +1,15 @@
-// Flags: --expose-internals
-
 'use strict';
 
 const common = require('../common');
 const {
+  Duplex,
   Readable,
   Transform,
   Writable,
   finished,
+  compose,
   PassThrough
 } = require('stream');
-const compose = require('internal/streams/compose');
 const assert = require('assert');
 
 {
@@ -419,4 +418,122 @@ const assert = require('assert');
     assert(!err);
     assert.strictEqual(buf, 'HELLOWORLD');
   }));
+}
+
+{
+  // In the new stream than should use the writeable of the first stream and readable of the last stream
+  // #46829
+  (async () => {
+    const newStream = compose(
+      new PassThrough({
+        // reading FROM you in object mode or not
+        readableObjectMode: false,
+
+        // writing TO you in object mode or not
+        writableObjectMode: false,
+      }),
+      new Transform({
+        // reading FROM you in object mode or not
+        readableObjectMode: true,
+
+        // writing TO you in object mode or not
+        writableObjectMode: false,
+        transform: (chunk, encoding, callback) => {
+          callback(null, {
+            value: chunk.toString()
+          });
+        }
+      })
+    );
+
+    assert.strictEqual(newStream.writableObjectMode, false);
+    assert.strictEqual(newStream.readableObjectMode, true);
+
+    newStream.write('Steve Rogers');
+    newStream.write('On your left');
+
+    newStream.end();
+
+    assert.deepStrictEqual(await newStream.toArray(), [{ value: 'Steve Rogers' }, { value: 'On your left' }]);
+  })().then(common.mustCall());
+}
+
+{
+  // In the new stream than should use the writeable of the first stream and readable of the last stream
+  // #46829
+  (async () => {
+    const newStream = compose(
+      new PassThrough({
+        // reading FROM you in object mode or not
+        readableObjectMode: true,
+
+        // writing TO you in object mode or not
+        writableObjectMode: true,
+      }),
+      new Transform({
+        // reading FROM you in object mode or not
+        readableObjectMode: false,
+
+        // writing TO you in object mode or not
+        writableObjectMode: true,
+        transform: (chunk, encoding, callback) => {
+          callback(null, chunk.value);
+        }
+      })
+    );
+
+    assert.strictEqual(newStream.writableObjectMode, true);
+    assert.strictEqual(newStream.readableObjectMode, false);
+
+    newStream.write({ value: 'Steve Rogers' });
+    newStream.write({ value: 'On your left' });
+
+    newStream.end();
+
+    assert.deepStrictEqual(await newStream.toArray(), [Buffer.from('Steve RogersOn your left')]);
+  })().then(common.mustCall());
+}
+
+{
+  class DuplexProcess extends Duplex {
+    constructor(options) {
+      super({ ...options, objectMode: true });
+      this.stuff = [];
+    }
+
+    _write(message, _, callback) {
+      this.stuff.push(message);
+      callback();
+    }
+
+    _destroy(err, cb) {
+      cb(err);
+    }
+
+    _read() {
+      if (this.stuff.length) {
+        this.push(this.stuff.shift());
+      } else if (this.writableEnded) {
+        this.push(null);
+      } else {
+        this._read();
+      }
+    }
+  }
+
+  const pass = new PassThrough({ objectMode: true });
+  const duplex = new DuplexProcess();
+
+  const composed = compose(
+    pass,
+    duplex
+  ).on('error', () => {});
+
+  composed.write('hello');
+  composed.write('world');
+  composed.end();
+
+  composed.destroy(new Error('an unexpected error'));
+  assert.strictEqual(duplex.destroyed, true);
+
 }

@@ -27,14 +27,19 @@ const net = require('net');
 const { readFileSync } = require('fs');
 
 if (common.isLinux) {
-  const unprivilegedPortStart = parseInt(readFileSync('/proc/sys/net/ipv4/ip_unprivileged_port_start'));
-  if (unprivilegedPortStart <= 42) {
-    common.skip('Port 42 is unprivileged');
+  try {
+    const unprivilegedPortStart = parseInt(readFileSync('/proc/sys/net/ipv4/ip_unprivileged_port_start'));
+    if (unprivilegedPortStart <= 42) {
+      common.skip('Port 42 is unprivileged');
+    }
+  } catch {
+    // Do nothing, feature doesn't exist, minimum is 1024 so 42 is usable.
+    // Continue...
   }
 }
 
-// Skip on OS X Mojave. https://github.com/nodejs/node/issues/21679
-if (common.isOSX)
+// Skip on macOS Mojave. https://github.com/nodejs/node/issues/21679
+if (common.isMacOS)
   common.skip('macOS may allow ordinary processes to use any port');
 
 if (common.isIBMi)
